@@ -1,0 +1,44 @@
+version: "3.8"
+
+services:
+  master:
+    build:
+      context: ./master
+      dockerfile: Dockerfile.masterr
+    container_name: master
+    ports:
+      - "8000:5000"
+    networks:
+      - cluster_net
+
+  secondary1:
+    build:
+      context: ./secondary
+      dockerfile: Dockerfile.secondary
+    container_name: secondary1
+    ports:
+      - "8001:5000"
+    networks:
+      - cluster_net
+    environment:
+      REPLICA_DELAY: 5
+    depends_on:
+      - master
+
+  secondary2:
+    build:
+      context: ./secondary
+      dockerfile: Dockerfile.secondary
+    container_name: secondary2
+    ports:
+      - "8002:5000"
+    networks:
+      - cluster_net
+    environment:
+      REPLICA_DELAY: 0
+    depends_on:
+      - master
+
+networks:
+  cluster_net:
+    driver: bridge
