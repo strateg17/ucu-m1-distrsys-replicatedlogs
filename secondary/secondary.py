@@ -57,7 +57,7 @@ def replicate():
 def get_messages():
     """Повертає всі повідомлення Secondary"""
     with messages_lock:
-        snapshot = list(messages)
+        snapshot = sorted(messages, key=lambda item: item["id"])
     return jsonify(snapshot)
 
 if __name__ == "__main__":
