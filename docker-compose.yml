@@ -3,8 +3,8 @@ version: "3.8"
 services:
   master:
     build:
-      context: ./master
-      dockerfile: Dockerfile.masterr
+      context: .
+      dockerfile: Dockerfile.master
     container_name: master
     ports:
       - "8000:5000"
@@ -13,7 +13,7 @@ services:
 
   secondary1:
     build:
-      context: ./secondary
+      context: .
       dockerfile: Dockerfile.secondary
     container_name: secondary1
     ports:
@@ -27,7 +27,7 @@ services:
 
   secondary2:
     build:
-      context: ./secondary
+      context: .
       dockerfile: Dockerfile.secondary
     container_name: secondary2
     ports:

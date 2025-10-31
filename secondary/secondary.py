@@ -1,6 +1,9 @@
 import os
 import time
 import logging
+import threading
+from typing import List
+
 from flask import Flask, request, jsonify
 
 # -------------------------------
@@ -13,7 +16,8 @@ app = Flask(__name__)
 # -------------------------------
 # Локальне сховище
 # -------------------------------
-messages = []  # [{id, text}]
+messages: List[dict] = []  # [{id, text}]
+messages_lock = threading.Lock()
 
 # Затримка для емуляції inconsistency
 REPLICA_DELAY = int(os.getenv("REPLICA_DELAY", "0"))
@@ -34,14 +38,17 @@ def replicate():
         logging.info(f"Затримка {REPLICA_DELAY}s перед записом...")
         time.sleep(REPLICA_DELAY)
 
-    # Deduplication
-    if not any(m["id"] == msg["id"] for m in messages):
-        messages.append(msg)
-        # Total ordering
-        messages.sort(key=lambda m: m["id"])
-        logging.info(f"Записано повідомлення {msg}")
-    else:
+    with messages_lock:
+        is_duplicate = any(m["id"] == msg["id"] for m in messages)
+        if not is_duplicate:
+            messages.append(msg)
+            # Total ordering
+            messages.sort(key=lambda m: m["id"])
+
+    if is_duplicate:
         logging.info(f"Ігноровано дубль {msg}")
+    else:
+        logging.info(f"Записано повідомлення {msg}")
 
     return jsonify({"status": "replicated", "msg": msg}), 200
 
@@ -49,7 +56,9 @@ def replicate():
 @app.route("/messages", methods=["GET"])
 def get_messages():
     """Повертає всі повідомлення Secondary"""
-    return jsonify(messages)
+    with messages_lock:
+        snapshot = list(messages)
+    return jsonify(snapshot)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
