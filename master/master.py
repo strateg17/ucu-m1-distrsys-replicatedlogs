@@ -72,8 +72,18 @@ async def post_message():
 
     # 1. Запис на master
     with messages_lock:
-        messages.append(msg)
-    logging.info(f"Отримав повідомлення {msg}, w={w}")
+        is_duplicate = any(existing["id"] == msg["id"] for existing in messages)
+        if not is_duplicate:
+            messages.append(msg)
+            messages.sort(key=lambda item: item["id"])
+
+    if is_duplicate:
+        logging.info(f"Отримав дубль повідомлення {msg}")
+    else:
+        logging.info(f"Отримав повідомлення {msg}, w={w}")
+
+    # Навіть у випадку дублю, продовжуємо реплікацію, щоб secondary гарантовано
+    # отримали останній стан.
 
     # 2. Реплікація на Secondaries
     tasks = []
@@ -127,7 +137,7 @@ async def replicate_to_secondary(url, msg):
 def get_messages():
     """Повертає всі повідомлення на master"""
     with messages_lock:
-        snapshot = list(messages)
+        snapshot = sorted(messages, key=lambda item: item["id"])
     return jsonify(snapshot)
 
 

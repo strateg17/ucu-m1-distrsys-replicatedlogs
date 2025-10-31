@@ -14,7 +14,7 @@ docker-compose up --build
 * secondary2 → порт 8002;
 
 ## Тестування 
-### 4.1. Додати повідомлення з w=1 (миттєвий успіх)
+### 4.1. Додати повідомлення з w=1 (миттєва відповідь від master)
 ```bash
 curl -X POST http://localhost:8000/message \
   -H "Content-Type: application/json" \
@@ -23,7 +23,7 @@ curl -X POST http://localhost:8000/message \
 ```
 Очікувана відповідь:
 ```json
-{"status":"ok","message_id":1,"confirmations":1,"required":1}
+{"status": "ok", "acks": 1, "msg": {"id": 1, "text": "Hello with w=1"}}
 ```
 
 ### 4.2 Додати повідомлення з w=2 (чекає хоча б одного Secondary)
@@ -48,6 +48,9 @@ curl http://localhost:8001/messages
 curl http://localhost:8002/messages
 ```
 
+> Через штучну затримку на `secondary1` (`REPLICA_DELAY=5`) за `w=1`
+> відповіді від master та secondary1 тимчасово відрізнятимуться.
+
 ## 5. Тест відмовостійкості
 ### 5.1 Зупиняємо Secondary1
 
@@ -68,8 +71,8 @@ curl -X POST http://localhost:8000/message \
 ```bash
 docker start secondary1
 ```
-➡️ Secondary1 при старті підтягне від Master пропущені повідомлення через /sync.
-➡️ Master також відправить pending чергу.
+➡️ Secondary1 при старті запитає у Master пропущені повідомлення через `/pending`.
+➡️ Master відправить увесь журнал, secondary виконає дедуплікацію та відсортує записи.
 
 Перевірка:
 
