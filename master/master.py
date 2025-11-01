@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import threading
-from typing import List
+from typing import Dict, List
 
 from flask import Flask, request, jsonify
 import httpx
@@ -20,8 +20,8 @@ messages: List[dict] = []      # [{id, text}]
 messages_lock = threading.Lock()
 next_id = 1                    # глобальний порядковий номер повідомлення
 counter_lock = threading.Lock()
-pending: List[tuple] = []       # список Secondary, яким потрібно догнати реплікацію
 pending_lock = threading.Lock()
+pending: Dict[str, List[dict]] = {}
 
 SECONDARIES = ["http://secondary1:5000", "http://secondary2:5000"]
 
@@ -34,6 +34,69 @@ def _drain_task_result(task: asyncio.Task) -> None:
             logging.warning(f"Помилка реплікації у фоновому режимі: {exc}")
     except asyncio.CancelledError:
         logging.warning("Фонова задача реплікації була скасована")
+
+
+def _enqueue_pending(url: str, msg: dict) -> None:
+    """Додає повідомлення в чергу pending для secondary, зберігаючи порядок."""
+    with pending_lock:
+        queue = pending.setdefault(url, [])
+        if any(item["id"] == msg["id"] for item in queue):
+            return
+        queue.append(msg)
+        queue.sort(key=lambda item: item["id"])
+
+
+def _remove_from_pending(url: str, msg_id: int) -> None:
+    """Видаляє повідомлення з pending, якщо воно там є."""
+    with pending_lock:
+        queue = pending.get(url)
+        if not queue:
+            return
+        pending[url] = [item for item in queue if item["id"] != msg_id]
+        if not pending[url]:
+            pending.pop(url, None)
+
+
+async def _send_to_secondary(url: str, msg: dict) -> bool:
+    """Надсилає повідомлення на secondary, повертає True/False залежно від успіху."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.post(f"{url}/replicate", json=msg, timeout=5.0)
+            if r.status_code == 200:
+                logging.info(f"Успішна реплікація на {url} -> {msg}")
+                return True
+            logging.warning(
+                f"Реплікація на {url} повернула статус {r.status_code}: {r.text}"
+            )
+    except Exception as exc:
+        logging.warning(f"Помилка реплікації на {url}: {exc}")
+    return False
+
+
+def _is_message_pending(url: str, msg_id: int) -> bool:
+    """Перевіряє, чи залишилося повідомлення в черзі pending для secondary."""
+    with pending_lock:
+        queue = pending.get(url, [])
+    return any(item["id"] == msg_id for item in queue)
+
+
+async def _flush_pending_queue(url: str) -> None:
+    """Послідовно надсилає всі pending-повідомлення на secondary, поки не вичерпає чергу."""
+    while True:
+        with pending_lock:
+            queue = pending.get(url, [])
+            if not queue:
+                return
+            msg = queue[0]
+
+        success = await _send_to_secondary(url, msg)
+        if success:
+            _remove_from_pending(url, msg["id"])
+            continue
+
+        # Не вдалося доставити поточне повідомлення — зупиняємося,
+        # черга залишиться для майбутніх спроб.
+        return
 
 
 
@@ -51,18 +114,18 @@ async def post_message():
     data = request.get_json() or {}
     text = data.get("text")
 
-    total_replicas = len(SECONDARIES) + 1
+    necessary_acks = len(SECONDARIES) + 1  # master + всі secondary
     requested_w = data.get("w")
     if requested_w is None:
-        w = total_replicas
+        w = necessary_acks
     else:
         requested_w = int(requested_w)
-        if requested_w > total_replicas:
+        if requested_w > necessary_acks:
             logging.warning(
-                f"Запитаний рівень write concern {requested_w} перевищує доступні репліки, "
-                f"використовую {total_replicas}"
+                f"Запитаний рівень write concern {requested_w} перевищує доступні ACK, "
+                f"використовую {necessary_acks}"
             )
-        w = max(1, min(requested_w, total_replicas))
+        w = max(1, min(requested_w, necessary_acks))
 
     with counter_lock:
         msg_id = next_id
@@ -93,10 +156,11 @@ async def post_message():
         tasks.append(task)
 
     # 3. Чекаємо потрібну кількість ACK
-    ack_count = 1  # master вже зарахований
     ack_target = w
+    required_secondary_acks = max(0, ack_target - 1)
+    confirmed_secondary_acks = 0
 
-    if ack_count < ack_target and tasks:
+    if required_secondary_acks > 0 and tasks:
         for future in asyncio.as_completed(tasks):
             try:
                 result = await future
@@ -105,12 +169,29 @@ async def post_message():
                 result = False
 
             if result:
-                ack_count += 1
+                confirmed_secondary_acks += 1
 
-            if ack_count >= ack_target:
+            if confirmed_secondary_acks >= required_secondary_acks:
                 break
 
+    ack_count = 1 + confirmed_secondary_acks  # master + secondary ACK, які ми дочекалися
     logging.info(f"ACK отримано: {ack_count}/{ack_target}")
+
+    if ack_count < ack_target:
+        logging.warning(
+            f"Не вдалося отримати {ack_target} підтверджень, повертаю помилку клієнту"
+        )
+        return (
+            jsonify(
+                {
+                    "status": "error",
+                    "acks": ack_count,
+                    "required": ack_target,
+                    "msg": msg,
+                }
+            ),
+            503,
+        )
 
     return jsonify({"status": "ok", "acks": ack_count, "msg": msg})
 
@@ -120,17 +201,12 @@ async def replicate_to_secondary(url, msg):
     Відправка повідомлення на secondary.
     Якщо secondary недоступний, додаємо його в pending.
     """
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{url}/replicate", json=msg, timeout=5.0)
-            if r.status_code == 200:
-                logging.info(f"Успішна реплікація на {url} -> {msg}")
-                return True
-    except Exception as e:
-        logging.warning(f"Помилка реплікації на {url}: {e}")
-        with pending_lock:
-            pending.append((url, msg))
-    return False
+    _enqueue_pending(url, msg)
+    await _flush_pending_queue(url)
+    delivered = not _is_message_pending(url, msg["id"])
+    if delivered:
+        logging.info(f"Повідомлення {msg['id']} синхронізовано з {url}")
+    return delivered
 
 
 @app.route("/messages", methods=["GET"])

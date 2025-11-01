@@ -19,6 +19,7 @@ app = Flask(__name__)
 # -------------------------------
 messages: List[dict] = []  # [{id, text}]
 messages_lock = threading.Lock()
+pending_sync_flag = threading.Event()
 
 # Затримка для емуляції inconsistency
 REPLICA_DELAY = int(os.getenv("REPLICA_DELAY", "0"))
@@ -80,17 +81,31 @@ def replicate():
         logging.info(f"Затримка {REPLICA_DELAY}s перед записом...")
         time.sleep(REPLICA_DELAY)
 
+    need_sync = True
     with messages_lock:
+        last_id = max((m["id"] for m in messages), default=0)
+        expected_next_id = last_id + 1
+
         is_duplicate = any(m["id"] == msg["id"] for m in messages)
         if not is_duplicate:
             messages.append(msg)
             # Total ordering
             messages.sort(key=lambda m: m["id"])
+            if msg["id"] > expected_next_id:
+                need_sync = True
 
     if is_duplicate:
         logging.info(f"Ігноровано дубль {msg}")
     else:
         logging.info(f"Записано повідомлення {msg}")
+        if need_sync:
+            logging.info(
+                f"Виявлено пропущені повідомлення (очікував id {expected_next_id}), "
+                "запускаю синхронізацію pending"
+            )
+
+    if need_sync:
+        schedule_pending_sync()
 
     return jsonify({"status": "replicated", "msg": msg}), 200
 
@@ -106,8 +121,18 @@ def get_messages():
 def schedule_pending_sync() -> None:
     """Запустити синхронізацію pending у фоні."""
 
+    if pending_sync_flag.is_set():
+        return
+
+    def _sync_wrapper() -> None:
+        try:
+            request_pending_from_master()
+        finally:
+            pending_sync_flag.clear()
+
+    pending_sync_flag.set()
     thread = threading.Thread(
-        target=request_pending_from_master,
+        target=_sync_wrapper,
         name="pending-sync",
         daemon=True,
     )
