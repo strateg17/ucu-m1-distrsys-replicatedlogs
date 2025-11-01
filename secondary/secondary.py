@@ -114,6 +114,12 @@ def schedule_pending_sync() -> None:
     thread.start()
 
 
-if __name__ == "__main__":
+@app.before_serving
+def launch_pending_sync() -> None:
+    """Ensure pending sync runs after the server starts accepting requests."""
+
     schedule_pending_sync()
+
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True, use_reloader=False)
