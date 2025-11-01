@@ -22,6 +22,8 @@ services:
       - cluster_net
     environment:
       REPLICA_DELAY: 5
+      MASTER_URL: http://master:5000
+      SECONDARY_URL: http://secondary1:5000
     depends_on:
       - master
 
@@ -36,6 +38,8 @@ services:
       - cluster_net
     environment:
       REPLICA_DELAY: 0
+      MASTER_URL: http://master:5000
+      SECONDARY_URL: http://secondary2:5000
     depends_on:
       - master
 
