@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import threading
-from typing import Dict, List
+from typing import Any, Dict, List, Coroutine
+
+from concurrent.futures import Future
 
 from flask import Flask, request, jsonify
 import httpx
@@ -26,14 +28,36 @@ pending: Dict[str, List[dict]] = {}
 SECONDARIES = ["http://secondary1:5000", "http://secondary2:5000"]
 
 
-def _drain_task_result(task: asyncio.Task) -> None:
-    """Helper to log exceptions from background replication tasks."""
+def _log_future_result(fut: Future) -> None:
+    """Log unexpected errors from background replication tasks."""
     try:
-        exc = task.exception()
-        if exc is not None:
-            logging.warning(f"Помилка реплікації у фоновому режимі: {exc}")
+        fut.result()
     except asyncio.CancelledError:
         logging.warning("Фонова задача реплікації була скасована")
+    except Exception as exc:
+        logging.warning(f"Помилка реплікації у фоновому режимі: {exc}")
+
+
+def _replication_loop_worker(loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
+replication_loop = asyncio.new_event_loop()
+replication_thread = threading.Thread(
+    target=_replication_loop_worker,
+    args=(replication_loop,),
+    name="replication-loop",
+    daemon=True,
+)
+replication_thread.start()
+
+
+def _schedule_replication(coro: Coroutine[Any, Any, bool]) -> asyncio.Future:
+    """Submit replication coroutine to the dedicated background loop."""
+    cfut = asyncio.run_coroutine_threadsafe(coro, replication_loop)
+    cfut.add_done_callback(_log_future_result)
+    return asyncio.wrap_future(cfut)
 
 
 def _enqueue_pending(url: str, msg: dict) -> None:
@@ -151,8 +175,7 @@ async def post_message():
     # 2. Реплікація на Secondaries
     tasks = []
     for sec in SECONDARIES:
-        task = asyncio.create_task(replicate_to_secondary(sec, msg))
-        task.add_done_callback(_drain_task_result)
+        task = _schedule_replication(replicate_to_secondary(sec, msg))
         tasks.append(task)
 
     # 3. Чекаємо потрібну кількість ACK
@@ -160,19 +183,24 @@ async def post_message():
     required_secondary_acks = max(0, ack_target - 1)
     confirmed_secondary_acks = 0
 
-    if required_secondary_acks > 0 and tasks:
-        for future in asyncio.as_completed(tasks):
-            try:
-                result = await future
-            except Exception as exc:
-                logging.warning(f"Помилка реплікації: {exc}")
-                result = False
+    if tasks:
+        if required_secondary_acks > 0:
+            for future in asyncio.as_completed(tasks):
+                try:
+                    result = await future
+                except Exception as exc:
+                    logging.warning(f"Помилка реплікації: {exc}")
+                    result = False
 
-            if result:
-                confirmed_secondary_acks += 1
+                if result:
+                    confirmed_secondary_acks += 1
 
-            if confirmed_secondary_acks >= required_secondary_acks:
-                break
+                if confirmed_secondary_acks >= required_secondary_acks:
+                    break
+        else:
+            # Для w=1 лише запускаємо фонові задачі та одразу повертаємо відповідь.
+            # Фоновий цикл реплікації гарантує, що задачі не буде скасовано.
+            pass
 
     ack_count = 1 + confirmed_secondary_acks  # master + secondary ACK, які ми дочекалися
     logging.info(f"ACK отримано: {ack_count}/{ack_target}")
