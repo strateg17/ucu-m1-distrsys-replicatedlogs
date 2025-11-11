@@ -104,23 +104,28 @@ def _is_message_pending(url: str, msg_id: int) -> bool:
     return any(item["id"] == msg_id for item in queue)
 
 
-async def _flush_pending_queue(url: str) -> None:
-    """Послідовно надсилає всі pending-повідомлення на secondary, поки не вичерпає чергу."""
+async def _flush_pending_queue(url: str) -> bool:
+    """Послідовно надсилає всі pending-повідомлення на secondary, поки не вичерпає чергу.
+
+    Повертає ``True``, якщо вдалося доставити хоча б одне повідомлення під час виклику.
+    """
+    delivered_any = False
     while True:
         with pending_lock:
             queue = pending.get(url, [])
             if not queue:
-                return
+                return delivered_any
             msg = queue[0]
 
         success = await _send_to_secondary(url, msg)
         if success:
+            delivered_any = True
             _remove_from_pending(url, msg["id"])
             continue
 
         # Не вдалося доставити поточне повідомлення — зупиняємося,
         # черга залишиться для майбутніх спроб.
-        return
+        return delivered_any
 
 
 
@@ -185,6 +190,9 @@ async def post_message():
 
     if tasks:
         if required_secondary_acks > 0:
+            logging.info(
+                f"Очікую підтверджень від {required_secondary_acks} secondary вузлів"
+            )
             for future in asyncio.as_completed(tasks):
                 try:
                     result = await future
@@ -194,6 +202,10 @@ async def post_message():
 
                 if result:
                     confirmed_secondary_acks += 1
+                    logging.info(
+                        f"Отримано підтвердження {confirmed_secondary_acks}/"
+                        f"{required_secondary_acks} secondary"
+                    )
 
                 if confirmed_secondary_acks >= required_secondary_acks:
                     break
@@ -230,11 +242,21 @@ async def replicate_to_secondary(url, msg):
     Якщо secondary недоступний, додаємо його в pending.
     """
     _enqueue_pending(url, msg)
-    await _flush_pending_queue(url)
-    delivered = not _is_message_pending(url, msg["id"])
-    if delivered:
-        logging.info(f"Повідомлення {msg['id']} синхронізовано з {url}")
-    return delivered
+    backoff = 0.5
+    max_backoff = 5.0
+
+    while True:
+        made_progress = await _flush_pending_queue(url)
+        delivered = not _is_message_pending(url, msg["id"])
+        if delivered:
+            logging.info(f"Повідомлення {msg['id']} синхронізовано з {url}")
+            return True
+
+        if not made_progress:
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, max_backoff)
+        else:
+            backoff = 0.5
 
 
 @app.route("/messages", methods=["GET"])

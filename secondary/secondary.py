@@ -2,7 +2,7 @@ import os
 import time
 import logging
 import threading
-from typing import List
+from typing import Dict, List
 
 import httpx
 from flask import Flask, request, jsonify
@@ -17,7 +17,8 @@ app = Flask(__name__)
 # -------------------------------
 # Локальне сховище
 # -------------------------------
-messages: List[dict] = []  # [{id, text}]
+messages_by_id: Dict[int, dict] = {}
+committed_upto = 0
 messages_lock = threading.Lock()
 pending_sync_flag = threading.Event()
 
@@ -29,7 +30,9 @@ MASTER_URL = os.getenv("MASTER_URL", "http://master:5000")
 SECONDARY_URL = os.getenv("SECONDARY_URL")
 
 
-def request_pending_from_master(max_retries: int = 5, retry_delay: float = 2.0) -> None:
+def request_pending_from_master(
+    initial_delay: float = 2.0, max_delay: float = 30.0
+) -> None:
     """Отримати пропущені повідомлення з master після рестарту."""
 
     if not MASTER_URL:
@@ -42,7 +45,10 @@ def request_pending_from_master(max_retries: int = 5, retry_delay: float = 2.0) 
 
     payload = {"url": SECONDARY_URL}
 
-    for attempt in range(1, max_retries + 1):
+    attempt = 0
+    delay = initial_delay
+    while True:
+        attempt += 1
         try:
             logging.info(
                 f"Спроба #{attempt} отримати pending з {MASTER_URL} для {SECONDARY_URL}"
@@ -61,9 +67,8 @@ def request_pending_from_master(max_retries: int = 5, retry_delay: float = 2.0) 
         except Exception as exc:  # pragma: no cover - логування помилок
             logging.warning(f"Не вдалося отримати pending з master: {exc}")
 
-        time.sleep(retry_delay)
-
-    logging.error("Вичерпано спроби отримати pending з master")
+        time.sleep(delay)
+        delay = min(delay * 2, max_delay)
 
 
 @app.route("/replicate", methods=["POST"])
@@ -76,23 +81,26 @@ def replicate():
     """
     msg = request.get_json()
 
+    global committed_upto
+
     # Штучна затримка
     if REPLICA_DELAY > 0:
         logging.info(f"Затримка {REPLICA_DELAY}s перед записом...")
         time.sleep(REPLICA_DELAY)
 
-    need_sync = True
+    need_sync = False
     with messages_lock:
-        last_id = max((m["id"] for m in messages), default=0)
-        expected_next_id = last_id + 1
-
-        is_duplicate = any(m["id"] == msg["id"] for m in messages)
+        is_duplicate = msg["id"] in messages_by_id
         if not is_duplicate:
-            messages.append(msg)
-            # Total ordering
-            messages.sort(key=lambda m: m["id"])
+            messages_by_id[msg["id"]] = msg
+
+            expected_next_id = committed_upto + 1
             if msg["id"] > expected_next_id:
                 need_sync = True
+            else:
+                # Оновлюємо межу підтверджених повідомлень
+                while messages_by_id.get(committed_upto + 1):
+                    committed_upto += 1
 
     if is_duplicate:
         logging.info(f"Ігноровано дубль {msg}")
@@ -100,8 +108,7 @@ def replicate():
         logging.info(f"Записано повідомлення {msg}")
         if need_sync:
             logging.info(
-                f"Виявлено пропущені повідомлення (очікував id {expected_next_id}), "
-                "запускаю синхронізацію pending"
+                "Виявлено пропущені повідомлення, запускаю синхронізацію pending"
             )
 
     if need_sync:
@@ -114,7 +121,7 @@ def replicate():
 def get_messages():
     """Повертає всі повідомлення Secondary"""
     with messages_lock:
-        snapshot = sorted(messages, key=lambda item: item["id"])
+        snapshot: List[dict] = [messages_by_id[i] for i in range(1, committed_upto + 1)]
     return jsonify(snapshot)
 
 
