@@ -1,7 +1,9 @@
 import asyncio
 import logging
 import threading
-from typing import Any, Dict, List, Coroutine
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Coroutine, Optional, Union
 
 from concurrent.futures import Future
 
@@ -26,6 +28,20 @@ pending_lock = threading.Lock()
 pending: Dict[str, List[dict]] = {}
 
 SECONDARIES = ["http://secondary1:5000", "http://secondary2:5000"]
+
+HEALTHY = "Healthy"
+SUSPECTED = "Suspected"
+UNHEALTHY = "Unhealthy"
+
+HEARTBEAT_INTERVAL = 2.0
+HEARTBEAT_TIMEOUT = 3.0
+SUSPECT_LATENCY_THRESHOLD = 1.0
+
+health_lock = threading.Lock()
+secondary_health: Dict[str, Dict[str, Any]] = {}
+secondary_availability: Dict[str, threading.Event] = {}
+heartbeat_handles: List[Future] = []
+heartbeat_started = threading.Event()
 
 
 def _log_future_result(fut: Future) -> None:
@@ -53,11 +69,41 @@ replication_thread = threading.Thread(
 replication_thread.start()
 
 
-def _schedule_replication(coro: Coroutine[Any, Any, bool]) -> asyncio.Future:
+def _schedule_replication(
+    coro: Coroutine[Any, Any, Any]
+) -> Union[asyncio.Future, Future]:
     """Submit replication coroutine to the dedicated background loop."""
     cfut = asyncio.run_coroutine_threadsafe(coro, replication_loop)
     cfut.add_done_callback(_log_future_result)
-    return asyncio.wrap_future(cfut)
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Виклик може відбуватися поза асинхронним контекстом (наприклад, під час
+        # ініціалізації heartbeat моніторів). У такому випадку повертаємо звичайний
+        # future з executor, щоб зберегти посилання на задачу.
+        return cfut
+
+    return asyncio.wrap_future(cfut, loop=loop)
+
+
+def _init_health_tracking() -> None:
+    with health_lock:
+        for url in SECONDARIES:
+            if url in secondary_health:
+                continue
+            secondary_health[url] = {
+                "status": HEALTHY,
+                "latency": None,
+                "last_checked": None,
+                "error": None,
+            }
+            event = threading.Event()
+            event.set()
+            secondary_availability[url] = event
+
+
+_init_health_tracking()
 
 
 def _enqueue_pending(url: str, msg: dict) -> None:
@@ -79,6 +125,101 @@ def _remove_from_pending(url: str, msg_id: int) -> None:
         pending[url] = [item for item in queue if item["id"] != msg_id]
         if not pending[url]:
             pending.pop(url, None)
+
+
+def _set_secondary_status(
+    url: str,
+    status: str,
+    *,
+    latency: Optional[float] = None,
+    error: Optional[str] = None,
+) -> None:
+    with health_lock:
+        info = secondary_health.setdefault(
+            url, {"status": UNHEALTHY, "latency": None, "last_checked": None, "error": None}
+        )
+        previous = info["status"]
+        info.update(
+            {
+                "status": status,
+                "latency": latency,
+                "last_checked": time.time(),
+                "error": error,
+            }
+        )
+
+    if previous != status:
+        logging.info(f"Стан {url} змінено: {previous} -> {status}")
+
+    availability = secondary_availability.setdefault(url, threading.Event())
+    if status == UNHEALTHY:
+        availability.clear()
+    else:
+        availability.set()
+
+
+def _record_heartbeat_success(url: str, latency: float) -> None:
+    status = HEALTHY if latency <= SUSPECT_LATENCY_THRESHOLD else SUSPECTED
+    error = None if status == HEALTHY else f"Latency {latency:.2f}s перевищує ліміт"
+    _set_secondary_status(url, status, latency=latency, error=error)
+
+
+def _record_heartbeat_failure(url: str, error: Exception) -> None:
+    _set_secondary_status(url, UNHEALTHY, latency=None, error=str(error))
+
+
+async def _heartbeat_monitor(url: str) -> None:
+    await asyncio.sleep(0.1)
+    while True:
+        start = asyncio.get_running_loop().time()
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{url}/health",
+                    timeout=HEARTBEAT_TIMEOUT,
+                )
+            latency = asyncio.get_running_loop().time() - start
+            if response.status_code == 200:
+                _record_heartbeat_success(url, latency)
+            else:
+                _record_heartbeat_failure(
+                    url,
+                    RuntimeError(
+                        f"Unexpected status {response.status_code}: {response.text}"
+                    ),
+                )
+        except Exception as exc:  # pragma: no cover - network errors
+            _record_heartbeat_failure(url, exc)
+
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+async def _wait_for_availability(url: str) -> None:
+    availability = secondary_availability.setdefault(url, threading.Event())
+    while not availability.is_set():
+        logging.info(f"{url} недоступний, очікую відновлення")
+        await asyncio.sleep(1.0)
+
+
+def _start_heartbeat_tasks() -> None:
+    if heartbeat_started.is_set():
+        return
+
+    heartbeat_started.set()
+    for url in SECONDARIES:
+        handle = _schedule_replication(_heartbeat_monitor(url))
+        heartbeat_handles.append(handle)
+
+
+@app.before_first_request
+def _bootstrap_background_tasks() -> None:
+    _start_heartbeat_tasks()
+
+
+def _format_timestamp(ts: Optional[float]) -> Optional[str]:
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
 
 
 async def _send_to_secondary(url: str, msg: dict) -> bool:
@@ -139,6 +280,8 @@ async def post_message():
     4. Чекаємо підтверджень (залежно від w).
     """
     global next_id
+
+    _start_heartbeat_tasks()
 
     data = request.get_json() or {}
     text = data.get("text")
@@ -246,6 +389,7 @@ async def replicate_to_secondary(url, msg):
     max_backoff = 5.0
 
     while True:
+        await _wait_for_availability(url)
         made_progress = await _flush_pending_queue(url)
         delivered = not _is_message_pending(url, msg["id"])
         if delivered:
@@ -264,6 +408,22 @@ def get_messages():
     """Повертає всі повідомлення на master"""
     with messages_lock:
         snapshot = sorted(messages, key=lambda item: item["id"])
+    return jsonify(snapshot)
+
+
+@app.route("/health", methods=["GET"])
+def get_secondaries_health():
+    with health_lock:
+        snapshot = {
+            url: {
+                "status": info.get("status", UNHEALTHY),
+                "latency_seconds": info.get("latency"),
+                "latency_ms": (info["latency"] * 1000) if info.get("latency") is not None else None,
+                "last_checked": _format_timestamp(info.get("last_checked")),
+                "error": info.get("error"),
+            }
+            for url, info in secondary_health.items()
+        }
     return jsonify(snapshot)
 
 
@@ -287,4 +447,5 @@ async def resend_pending():
 
 
 if __name__ == "__main__":
+    _start_heartbeat_tasks()
     app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)

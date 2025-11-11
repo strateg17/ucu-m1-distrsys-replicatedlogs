@@ -125,6 +125,17 @@ def get_messages():
     return jsonify(snapshot)
 
 
+@app.route("/health", methods=["GET"])
+def healthcheck():
+    with messages_lock:
+        replicated = committed_upto
+    return jsonify({
+        "status": "ok",
+        "committed_upto": replicated,
+        "replica_delay": REPLICA_DELAY,
+    })
+
+
 def schedule_pending_sync() -> None:
     """Запустити синхронізацію pending у фоні."""
 
