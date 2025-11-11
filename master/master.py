@@ -211,9 +211,14 @@ def _start_heartbeat_tasks() -> None:
         heartbeat_handles.append(handle)
 
 
-@app.before_first_request
 def _bootstrap_background_tasks() -> None:
     _start_heartbeat_tasks()
+
+
+if hasattr(app, "before_serving"):
+    app.before_serving(_bootstrap_background_tasks)
+else:  # Flask 3.x прибрав before_first_request, fallback на before_request
+    app.before_request(_bootstrap_background_tasks)
 
 
 def _format_timestamp(ts: Optional[float]) -> Optional[str]:
