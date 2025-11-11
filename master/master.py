@@ -44,6 +44,12 @@ heartbeat_handles: List[Future] = []
 heartbeat_started = threading.Event()
 
 
+def _is_secondary_available(url: str) -> bool:
+    with health_lock:
+        event = secondary_availability.get(url)
+        return bool(event and event.is_set())
+
+
 def _log_future_result(fut: Future) -> None:
     """Log unexpected errors from background replication tasks."""
     try:
@@ -211,9 +217,14 @@ def _start_heartbeat_tasks() -> None:
         heartbeat_handles.append(handle)
 
 
-@app.before_first_request
 def _bootstrap_background_tasks() -> None:
     _start_heartbeat_tasks()
+
+
+if hasattr(app, "before_serving"):
+    app.before_serving(_bootstrap_background_tasks)
+else:  # Flask 3.x прибрав before_first_request, fallback на before_request
+    app.before_request(_bootstrap_background_tasks)
 
 
 def _format_timestamp(ts: Optional[float]) -> Optional[str]:
@@ -321,10 +332,9 @@ async def post_message():
     # отримали останній стан.
 
     # 2. Реплікація на Secondaries
-    tasks = []
+    tasks: Dict[str, asyncio.Future] = {}
     for sec in SECONDARIES:
-        task = _schedule_replication(replicate_to_secondary(sec, msg))
-        tasks.append(task)
+        tasks[sec] = _schedule_replication(replicate_to_secondary(sec, msg))
 
     # 3. Чекаємо потрібну кількість ACK
     ack_target = w
@@ -332,11 +342,23 @@ async def post_message():
     confirmed_secondary_acks = 0
 
     if tasks:
-        if required_secondary_acks > 0:
+        wait_urls = [url for url in SECONDARIES if _is_secondary_available(url)]
+        wait_futures = [tasks[url] for url in wait_urls if url in tasks]
+
+        if required_secondary_acks > len(wait_futures):
+            logging.info(
+                "Запитаний рівень w=%s потребує %s secondary ACK, але доступні лише %s",
+                w,
+                required_secondary_acks,
+                len(wait_futures),
+            )
+            required_secondary_acks = len(wait_futures)
+
+        if wait_futures and required_secondary_acks > 0:
             logging.info(
                 f"Очікую підтверджень від {required_secondary_acks} secondary вузлів"
             )
-            for future in asyncio.as_completed(tasks):
+            for future in asyncio.as_completed(wait_futures):
                 try:
                     result = await future
                 except Exception as exc:
@@ -352,10 +374,14 @@ async def post_message():
 
                 if confirmed_secondary_acks >= required_secondary_acks:
                     break
-        else:
+        elif required_secondary_acks <= 0:
             # Для w=1 лише запускаємо фонові задачі та одразу повертаємо відповідь.
             # Фоновий цикл реплікації гарантує, що задачі не буде скасовано.
             pass
+        else:
+            logging.warning(
+                "Немає жодної доступної secondary ноди для підтвердження запису"
+            )
 
     ack_count = 1 + confirmed_secondary_acks  # master + secondary ACK, які ми дочекалися
     logging.info(f"ACK отримано: {ack_count}/{ack_target}")
