@@ -341,20 +341,10 @@ async def post_message():
     required_secondary_acks = max(0, ack_target - 1)
     confirmed_secondary_acks = 0
 
-    if tasks:
-        wait_urls = [url for url in SECONDARIES if _is_secondary_available(url)]
-        wait_futures = [tasks[url] for url in wait_urls if url in tasks]
+    if tasks and required_secondary_acks > 0:
+        wait_futures = list(tasks.values())
 
-        if required_secondary_acks > len(wait_futures):
-            logging.info(
-                "Запитаний рівень w=%s потребує %s secondary ACK, але доступні лише %s",
-                w,
-                required_secondary_acks,
-                len(wait_futures),
-            )
-            required_secondary_acks = len(wait_futures)
-
-        if wait_futures and required_secondary_acks > 0:
+        if wait_futures:
             logging.info(
                 f"Очікую підтверджень від {required_secondary_acks} secondary вузлів"
             )
@@ -374,10 +364,6 @@ async def post_message():
 
                 if confirmed_secondary_acks >= required_secondary_acks:
                     break
-        elif required_secondary_acks <= 0:
-            # Для w=1 лише запускаємо фонові задачі та одразу повертаємо відповідь.
-            # Фоновий цикл реплікації гарантує, що задачі не буде скасовано.
-            pass
         else:
             logging.warning(
                 "Немає жодної доступної secondary ноди для підтвердження запису"
