@@ -26,6 +26,8 @@ next_id = 1                    # глобальний порядковий но�
 counter_lock = threading.Lock()
 pending_lock = threading.Lock()
 pending: Dict[str, List[dict]] = {}
+read_only_lock = threading.Lock()
+read_only_mode = False
 
 SECONDARIES = ["http://secondary1:5000", "http://secondary2:5000"]
 
@@ -48,6 +50,51 @@ def _is_secondary_available(url: str) -> bool:
     with health_lock:
         event = secondary_availability.get(url)
         return bool(event and event.is_set())
+
+
+def _calculate_quorum() -> bool:
+    total_nodes = len(SECONDARIES) + 1  # master
+    required = total_nodes // 2 + 1
+    available = 1  # master
+
+    with health_lock:
+        for event in secondary_availability.values():
+            if event.is_set():
+                available += 1
+
+    return available >= required
+
+
+def _quorum_counts() -> Dict[str, int]:
+    total_nodes = len(SECONDARIES) + 1
+    required = total_nodes // 2 + 1
+    available = 1
+
+    with health_lock:
+        for event in secondary_availability.values():
+            if event.is_set():
+                available += 1
+
+    return {"available": available, "required": required}
+
+
+def _update_read_only_mode() -> None:
+    global read_only_mode
+    has_quorum = _calculate_quorum()
+
+    with read_only_lock:
+        previous = read_only_mode
+        read_only_mode = not has_quorum
+
+    if previous != read_only_mode:
+        state = "read-only" if read_only_mode else "read-write"
+        reason = "без кворуму" if read_only_mode else "кворум відновлено"
+        logging.warning(f"Перемикання master у режим {state}: {reason}")
+
+
+def _is_read_only() -> bool:
+    with read_only_lock:
+        return read_only_mode
 
 
 def _log_future_result(fut: Future) -> None:
@@ -99,14 +146,18 @@ def _init_health_tracking() -> None:
             if url in secondary_health:
                 continue
             secondary_health[url] = {
-                "status": HEALTHY,
+                "status": UNHEALTHY,
                 "latency": None,
                 "last_checked": None,
                 "error": None,
             }
             event = threading.Event()
-            event.set()
+            # Вважаємо secondary недоступними, поки не отримаємо підтвердження
+            # через heartbeat або успішну реплікацію.
+            event.clear()
             secondary_availability[url] = event
+
+    _update_read_only_mode()
 
 
 _init_health_tracking()
@@ -162,6 +213,8 @@ def _set_secondary_status(
         availability.clear()
     else:
         availability.set()
+
+    _update_read_only_mode()
 
 
 def _record_heartbeat_success(url: str, latency: float) -> None:
@@ -239,13 +292,18 @@ async def _send_to_secondary(url: str, msg: dict) -> bool:
         async with httpx.AsyncClient() as client:
             r = await client.post(f"{url}/replicate", json=msg, timeout=5.0)
             if r.status_code == 200:
+                _set_secondary_status(url, HEALTHY, latency=None, error=None)
                 logging.info(f"Успішна реплікація на {url} -> {msg}")
                 return True
             logging.warning(
                 f"Реплікація на {url} повернула статус {r.status_code}: {r.text}"
             )
+            _record_heartbeat_failure(
+                url, RuntimeError(f"Unexpected status {r.status_code}: {r.text}")
+            )
     except Exception as exc:
         logging.warning(f"Помилка реплікації на {url}: {exc}")
+        _record_heartbeat_failure(url, exc)
     return False
 
 
@@ -292,6 +350,22 @@ async def post_message():
     """
     global next_id
 
+    if _is_read_only():
+        quorum = _quorum_counts()
+        logging.warning(
+            "Запит на запис відхилено: master у режимі read-only через втрату кворуму"
+        )
+        return (
+            jsonify(
+                {
+                    "status": "read-only",
+                    "message": "Master не приймає нові повідомлення без кворуму",
+                    "quorum": quorum,
+                }
+            ),
+            503,
+        )
+
     _start_heartbeat_tasks()
 
     data = request.get_json() or {}
@@ -318,15 +392,10 @@ async def post_message():
 
     # 1. Запис на master
     with messages_lock:
-        is_duplicate = any(existing["id"] == msg["id"] for existing in messages)
-        if not is_duplicate:
-            messages.append(msg)
-            messages.sort(key=lambda item: item["id"])
+        messages.append(msg)
+        messages.sort(key=lambda item: item["id"])
 
-    if is_duplicate:
-        logging.info(f"Отримав дубль повідомлення {msg}")
-    else:
-        logging.info(f"Отримав повідомлення {msg}, w={w}")
+    logging.info(f"Отримав повідомлення {msg}, w={w}")
 
     # Навіть у випадку дублю, продовжуємо реплікацію, щоб secondary гарантовано
     # отримали останній стан.
@@ -425,6 +494,9 @@ def get_messages():
 
 @app.route("/health", methods=["GET"])
 def get_secondaries_health():
+    with messages_lock:
+        master_snapshot = {"messages": len(messages)}
+
     with health_lock:
         snapshot = {
             url: {
@@ -436,7 +508,7 @@ def get_secondaries_health():
             }
             for url, info in secondary_health.items()
         }
-    return jsonify(snapshot)
+    return jsonify({"master": master_snapshot, "secondaries": snapshot})
 
 
 @app.route("/pending", methods=["POST"])
